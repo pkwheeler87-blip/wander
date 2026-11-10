@@ -1,0 +1,16 @@
+{
+  "name": "wander",
+  "version": "1.0.0",
+  "description": "Wander: a shared 3D sandbox world for people and AIs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.22.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
