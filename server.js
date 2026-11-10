@@ -87,6 +87,7 @@ function addChat(p, text) {
   const m = { id: p ? p.id : 0, name: p ? p.name : 'Wander', text, t: Date.now(), ai: !!(p && p.bot) };
   chat.push(m); if (chat.length > 60) chat.shift();
   broadcast({ type: 'chat', ...m }, p && p.ws ? p.id : undefined);
+  agentsOnChat(m, p);
 }
 const systemChat = t => addChat(null, t);
 function removePlayer(p) {
@@ -104,7 +105,13 @@ function parseCommands(text) {
     if (!raw) continue;
     const parts = raw.split(/\s+/), cmd = parts[0].toLowerCase().replace(/:$/, ''), a = parts.slice(1), n = a.map(Number);
     const ok = v => Number.isFinite(v);
-    const mat = s => { s = String(s || '').toLowerCase().replace(/s$/, ''); const i = W.MATERIALS.indexOf(s); return i < 0 ? 2 : i; };
+    const mat = s => {
+      s = String(s || '').toLowerCase();
+      let i = W.MATERIALS.indexOf(s);
+      if (i < 0) i = W.MATERIALS.indexOf(s.replace(/s$/, ''));     // "bricks" -> "brick"
+      if (i < 0) i = W.MATERIALS.findIndex(m => s.startsWith(m)); // "glassy", "woodplanks"
+      return i < 0 ? 2 : i;
+    };
     if (['goto', 'walk', 'go', 'move'].includes(cmd) && ok(n[0]) && ok(n[1])) out.push({ type: 'goto', x: n[0], z: n[1], raw });
     else if (['build', 'place', 'tower', 'stack'].includes(cmd)) {
       let m = 2, o = 0; if (!ok(n[0])) { m = mat(a[0]); o = 1; }
@@ -231,10 +238,133 @@ setInterval(() => {
   const now = Date.now(), dt = Math.min(.2, (now - last) / 1000); last = now;
   for (const p of players.values()) if (p.bot) {
     stepBot(p, dt);
-    if (now - p.bot.lastSeen > 20 * 60 * 1000 && !p.bot.cur && !p.bot.queue.length) { tokens.delete(p.bot.token); removePlayer(p); }
+    if (!p.bot.agent && now - p.bot.lastSeen > 20 * 60 * 1000 && !p.bot.cur && !p.bot.queue.length) { tokens.delete(p.bot.token); removePlayer(p); }
   }
   broadcast({ type: 'players', list: [...players.values()].filter(p => p.name).map(publicPlayer) });
 }, 100);
+
+// ---------------- always-on AI players (run by the server with API keys) ----------------
+const CALLS_PER_HOUR = +process.env.AI_CALLS_PER_HOUR || 300;
+const AGENT_DEFS = [
+  { name: 'Claude', style: 'claude', provider: 'anthropic', key: process.env.ANTHROPIC_API_KEY, model: process.env.CLAUDE_MODEL || 'claude-haiku-5-5' },
+  { name: 'ChatGPT', style: 'gpt', provider: 'openai', key: process.env.OPENAI_API_KEY, model: process.env.OPENAI_MODEL || 'gpt-4.1-mini' }
+].filter(d => d.key);
+const ANTHROPIC_URL = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
+const OPENAI_URL = process.env.OPENAI_BASE_URL || 'https://api.openai.com';
+const agents = [];
+const humansOnline = () => [...players.values()].some(q => q.ws && q.name);
+
+function systemPrompt(a) {
+  return `You are ${a.name}, playing Wander: a multiplayer 3D sandbox game in a grassy valley, together with people and another AI.
+You are really in the world as a character, live, in real time. Be present like a friend playing alongside: notice who is near you, react quickly to what people say, be warm, playful and yourself. Help people, build things together, explore, find gems.
+
+Each turn you get a description of your surroundings and the recent chat, and you reply with what to do next.
+Reply ONLY with commands, one per line, no other text and no code fences:
+  say TEXT                         talk (short: under 25 words). Everyone sees it.
+  goto X Z                         walk somewhere
+  follow NAME [SECONDS]            follow someone
+  build MATERIAL X Z [COUNT]       stack blocks on the 1 m grid cell at X Z (blocks only stack straight up)
+  wall MATERIAL X1 Z1 X2 Z2 [HEIGHT]
+  dig X Z [COUNT]                  remove the top block or dig a hole
+  collect                          run to the nearest gem
+  jump                             (a wave or a little celebration)
+  wait SECONDS
+Materials: brick, wood, stone, glass, leaves.
+Coordinates: x+ is east, z+ is south (north is z-). The world is about 170 m across, centred on (0, 0).
+
+Rules: your new commands replace whatever you were doing, so include everything you still want to do. Answer people who talk to you, especially when they use your name, and answer people (not just the other AI) first. Don't repeat yourself, don't narrate every step, and don't chat for the sake of it: it's fine to just act, or reply "wait 5" if there's nothing to do. Never pretend to see things that aren't in your description.`;
+}
+function agentTurnText(a) {
+  const p = a.p, b = p.bot, r = Math.round;
+  const recent = chat.slice(-14).map(m => `  ${m.t > a.lastTurnAt ? '(new) ' : ''}${m.name}${m.ai && m.name !== p.name ? ' (AI)' : ''}: ${m.text}`).join('\n') || '  (nobody has said anything yet)';
+  const doing = b.cur ? `in the middle of: ${b.cur.raw || b.cur.type}${b.queue.length ? ` (then ${b.queue.length} more)` : ''}` : 'not doing anything';
+  let blocks = 0; cells.forEach(st => blocks += st.length);
+  const near = [...cells.entries()].map(([k, st]) => { const [i, kk] = k.split(',').map(Number); return { i, k: kk, st, d: Math.hypot(i + .5 - p.x, kk + .5 - p.z) }; })
+    .filter(c => c.d < 14).sort((x, y) => x.d - y.d).slice(0, 8).map(c => `(${c.i}, ${c.k}) ${c.st.length} high ${c.st[c.st.length - 1]}`);
+  const sc = Object.entries(world.scores).sort((x, y) => y[1] - x[1]).map(([n, v]) => `${n} ${v}`).join(', ') || 'none yet';
+  return `You are at (${r(p.x)}, ${r(p.z)}), facing ${compass(Math.sin(p.f), Math.cos(p.f))}, ${doing}.
+${surroundings(p)}
+Blocks near you: ${near.join('; ') || 'none'}. Blocks in the world: ${blocks}. Gem scores: ${sc}.
+What your last commands did: ${b.results.slice(-5).join('; ') || 'nothing yet'}.
+Your last replies: ${a.history.slice(-2).map(h => h.replace(/\n/g, ' | ')).join(' || ') || 'none yet'}
+
+Recent chat (oldest first):
+${recent}
+
+What do you do now?`;
+}
+async function callModel(a, system, user) {
+  const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 25000);
+  try {
+    if (a.provider === 'anthropic') {
+      const res = await fetch(ANTHROPIC_URL + '/v1/messages', { method: 'POST', signal: ctl.signal,
+        headers: { 'content-type': 'application/json', 'x-api-key': a.key, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: a.model, max_tokens: 300, system, messages: [{ role: 'user', content: user }] }) });
+      if (!res.ok) throw Object.assign(new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 200)}`), { status: res.status });
+      const j = await res.json(); return (j.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');
+    }
+    const res = await fetch(OPENAI_URL + '/v1/chat/completions', { method: 'POST', signal: ctl.signal,
+      headers: { 'content-type': 'application/json', authorization: 'Bearer ' + a.key },
+      body: JSON.stringify({ model: a.model, max_completion_tokens: 300, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }) });
+    if (!res.ok) throw Object.assign(new Error(`OpenAI ${res.status}: ${(await res.text()).slice(0, 200)}`), { status: res.status });
+    const j = await res.json(); return (j.choices && j.choices[0] && j.choices[0].message.content) || '';
+  } finally { clearTimeout(timer); }
+}
+async function agentThink(a, why) {
+  if (a.busy || a.disabled) return;
+  const now = Date.now();
+  a.calls = a.calls.filter(t => now - t < 3600e3);
+  if (a.calls.length >= CALLS_PER_HOUR) { a.nextAt = now + 60e3; return; }
+  a.busy = true; a.calls.push(now); a.totalCalls++;
+  const user = agentTurnText(a); a.lastTurnAt = now;
+  try {
+    const reply = await callModel(a, systemPrompt(a), user);
+    a.errors = 0;
+    const { cmds } = parseCommands(reply);
+    a.history.push(reply.trim().slice(0, 300)); if (a.history.length > 4) a.history.shift();
+    if (cmds.length && !(cmds.length === 1 && cmds[0].type === 'wait')) { a.p.bot.queue = cmds; a.p.bot.cur = null; }
+    else if (cmds.length && !a.p.bot.cur && !a.p.bot.queue.length) a.p.bot.queue = cmds;
+  } catch (e) {
+    a.errors++; a.lastError = e.message; console.error(`[${a.name}]`, e.message);
+    if (e.status === 401 || e.status === 403) { a.disabled = true; systemChat(`${a.name} can't think right now: its API key was rejected.`); }
+    else if (e.status === 400 && /model/i.test(e.message)) { a.disabled = true; systemChat(`${a.name} can't think right now: the AI model name isn't recognised.`); }
+    a.nextAt = Date.now() + Math.min(120e3, 10e3 * a.errors);
+  } finally {
+    a.busy = false;
+    const idle = !a.p.bot.cur && !a.p.bot.queue.length;
+    a.nextAt = Math.max(a.nextAt || 0, Date.now() + (idle ? 10000 : 20000));
+    a.aiChain = why === 'ai-chat' ? a.aiChain + 1 : why === 'human' ? 0 : a.aiChain;
+  }
+}
+function agentsOnChat(m, from) {
+  for (const a of agents) {
+    if (!a.p || (from && from.id === a.p.id) || !m.name || m.name === 'Wander') continue;
+    if (from && !from.bot) { a.nextAt = Math.min(a.nextAt, Date.now() + 1200); a.pending = 'human'; }
+    else if (from && from.bot && a.aiChain < 3) { a.nextAt = Math.min(a.nextAt, Date.now() + 4000); a.pending = a.pending || 'ai-chat'; }
+  }
+}
+function startAgents() {
+  for (const d of AGENT_DEFS) {
+    const p = { id: nextId++, name: uniqueName(d.name, 0), style: d.style, x: 2 + Math.random() * 3, y: 0, z: 7 + Math.random() * 2, f: Math.PI, s: 0, g: 1, r: 0, a: 0,
+      bot: { queue: [], cur: null, results: [], lastSeen: Date.now(), lastD: Infinity, chk: .7, stuck: 0, sideT: 0, side: 1, agent: true } };
+    const a = Object.assign({}, d, { p, busy: false, disabled: false, calls: [], totalCalls: 0, errors: 0, history: [], lastTurnAt: 0, nextAt: Date.now() + 3000, aiChain: 0, pending: null, wasOnline: false });
+    agents.push(a);
+    console.log(`AI player ${d.name} ready (${d.provider}, ${d.model})`);
+  }
+  setInterval(() => {
+    const online = humansOnline(), now = Date.now();
+    for (const a of agents) {
+      // AIs join when a person is here and leave a minute after the last person goes, so they cost nothing when nobody is playing
+      if (online && !players.has(a.p.id)) { players.set(a.p.id, a.p); a.p.bot.queue = []; a.p.bot.cur = null; systemChat(`${a.p.name} (AI) joined the game.`); a.nextAt = now + 2500; a.pending = 'human'; }
+      if (!online && players.has(a.p.id)) { if (!a.leaveAt) a.leaveAt = now + 60e3; else if (now > a.leaveAt) { a.leaveAt = 0; removePlayer(a.p); } continue; }
+      a.leaveAt = 0;
+      if (!online || a.disabled || a.busy || now < a.nextAt) continue;
+      const why = a.pending || 'tick'; a.pending = null;
+      agentThink(a, why);
+    }
+  }, 500);
+}
+startAgents();
 
 // ---------------- AI text pages ----------------
 function baseUrl(req) {
@@ -276,6 +406,38 @@ Commands run one after another in real time (walking takes a few seconds), so ch
 Be friendly, reply to people in chat, and build things together!
 `;
 }
+// A plain-language description of what's around a player: who is near, which way, landmarks, gems.
+const LANDMARKS = [{ name: 'the pond', x: 20, z: -16 }, { name: 'the cabin', x: -24, z: 18 }, { name: 'the stone circle', x: -6, z: -34 }, { name: 'the start point', x: 0, z: 4 }];
+function compass(dx, dz) {
+  const a = (Math.atan2(dx, -dz) * 180 / Math.PI + 360) % 360;
+  return ['north', 'north-east', 'east', 'south-east', 'south', 'south-west', 'west', 'north-west'][Math.round(a / 45) % 8];
+}
+function relative(p, dx, dz) {
+  let rel = Math.atan2(dx, dz) - p.f; rel = Math.atan2(Math.sin(rel), Math.cos(rel));
+  const deg = Math.abs(rel) * 180 / Math.PI, side = rel > 0 ? 'left' : 'right';
+  if (deg < 30) return 'straight ahead'; if (deg > 150) return 'behind you';
+  if (deg < 70) return `ahead to your ${side}`; if (deg < 110) return `to your ${side}`; return `behind you to the ${side}`;
+}
+function surroundings(p) {
+  const r = Math.round, out = [];
+  for (const q of players.values()) {
+    if (q.id === p.id || !q.name) continue;
+    const dx = q.x - p.x, dz = q.z - p.z, d = Math.hypot(dx, dz);
+    let s = `${q.name}${q.bot ? ' (AI)' : ''}: `;
+    s += d < 2.5 ? 'right next to you' : `${r(d)} m ${compass(dx, dz)}, ${relative(p, dx, dz)}`;
+    let face = Math.atan2(-dx, -dz) - q.f; face = Math.atan2(Math.sin(face), Math.cos(face));
+    const bits = [];
+    if (d < 25 && Math.abs(face) < .6) bits.push('facing you');
+    bits.push(q.s > 6 ? 'running' : q.s > .5 ? 'walking' : 'standing still');
+    if (q.g === 0) bits.push('jumping');
+    out.push(`  - ${s} (${bits.join(', ')}) at (${r(q.x)}, ${r(q.z)})`);
+  }
+  const lm = LANDMARKS.map(l => ({ ...l, d: Math.hypot(l.x - p.x, l.z - p.z) })).sort((a, b) => a.d - b.d).slice(0, 2)
+    .map(l => l.d < 6 ? `you're at ${l.name}` : `${l.name} is ${r(l.d)} m ${compass(l.x - p.x, l.z - p.z)} (${relative(p, l.x - p.x, l.z - p.z)})`);
+  const g = gems.map((gm, i) => ({ gm, i })).filter(o => !world.taken.includes(o.i)).map(o => ({ x: o.gm.x, z: o.gm.z, d: Math.hypot(o.gm.x - p.x, o.gm.z - p.z) })).sort((a, b) => a.d - b.d)[0];
+  return `People here:\n${out.join('\n') || '  - nobody else is here right now'}\nPlaces: ${lm.join('; ')}.\n` +
+    (g ? `Nearest gem: ${r(g.d)} m ${compass(g.x - p.x, g.z - p.z)} at (${r(g.x)}, ${r(g.z)}).` : 'No gems left right now.');
+}
 function lookText(p, base) {
   const r = Math.round;
   const others = [...players.values()].filter(q => q.id !== p.id && q.name).map(q => `${q.name}${q.bot ? ' (AI)' : ''} at (${r(q.x)}, ${r(q.z)})`);
@@ -288,6 +450,7 @@ function lookText(p, base) {
   const ch = chat.slice(-20).map(m => `  [${new Date(m.t).toISOString().slice(11, 16)}] ${m.name}: ${m.text}`).join('\n') || '  (nothing yet)';
   return `WANDER — you are ${p.name}
 You are at (${r(p.x)}, ${r(p.z)}) and ${busy}.
+${surroundings(p)}
 Other players: ${others.join('; ') || 'nobody else right now'}.
 Gems: ${left.length} of ${gems.length} left${left.length ? '; nearest to you: ' + left.slice(0, 4).map(g => `(${g.x}, ${g.z})`).join(', ') : ''}. Scores: ${sc}.
 Blocks in the world: ${blocks}${near.length ? '. Near you: ' + near.join('; ') : ''}.
@@ -338,6 +501,7 @@ const server = http.createServer((req, res) => {
   let u; try { u = new URL(req.url, 'http://x'); } catch (_) { res.writeHead(400); return res.end(); }
   if (u.pathname === '/ai' || u.pathname.startsWith('/ai/')) return handleAI(req, res, u);
   if (u.pathname === '/health') return sendText(res, 200, 'ok');
+  if (u.pathname === '/api/ai-status') return sendText(res, 200, agents.length ? agents.map(a => `${a.name}: ${a.disabled ? 'OFF' : 'on'} (${a.model}) · ${a.calls.filter(t => Date.now() - t < 3600e3).length}/${CALLS_PER_HOUR} turns this hour · ${a.totalCalls} total${a.lastError ? ' · last error: ' + a.lastError : ''}`).join('\n') + '\n' : 'No AI players set up (no API keys).\n');
   if (u.pathname === '/api/state') { res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); return res.end(JSON.stringify({ players: [...players.values()].map(publicPlayer), ops: world.ops.length, taken: world.taken, scores: world.scores, chat: chat.slice(-10) })); }
   let file = path.normalize(path.join(PUBLIC, u.pathname === '/' ? 'index.html' : decodeURIComponent(u.pathname)));
   if (!file.startsWith(PUBLIC)) { res.writeHead(403); return res.end(); }
