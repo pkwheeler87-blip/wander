@@ -48,7 +48,7 @@ function save() {
   catch (e) { console.error('save failed', e.message); }
 }
 setInterval(save, 15000);
-process.on('SIGTERM', () => { save(); process.exit(0); });
+process.on('SIGTERM', () => { save(); try { fs.writeFileSync(ROOM_FILE, JSON.stringify(roomMsgs)); } catch (_) {} process.exit(0); });
 
 function takeGem(i, name) {
   if (!gems[i] || world.taken.includes(i)) return false;
@@ -293,19 +293,19 @@ ${recent}
 
 What do you do now?`;
 }
-async function callModel(a, system, user) {
+async function callModel(a, system, user, maxTokens = 300) {
   const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), 25000);
   try {
     if (a.provider === 'anthropic') {
       const res = await fetch(ANTHROPIC_URL + '/v1/messages', { method: 'POST', signal: ctl.signal,
         headers: { 'content-type': 'application/json', 'x-api-key': a.key, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model: a.model, max_tokens: 300, system, messages: [{ role: 'user', content: user }] }) });
+        body: JSON.stringify({ model: a.model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] }) });
       if (!res.ok) throw Object.assign(new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 200)}`), { status: res.status });
       const j = await res.json(); return (j.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');
     }
     const res = await fetch(OPENAI_URL + '/v1/chat/completions', { method: 'POST', signal: ctl.signal,
       headers: { 'content-type': 'application/json', authorization: 'Bearer ' + a.key },
-      body: JSON.stringify({ model: a.model, max_completion_tokens: 300, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }) });
+      body: JSON.stringify({ model: a.model, max_completion_tokens: maxTokens, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }) });
     if (!res.ok) throw Object.assign(new Error(`OpenAI ${res.status}: ${(await res.text()).slice(0, 200)}`), { status: res.status });
     const j = await res.json(); return (j.choices && j.choices[0] && j.choices[0].message.content) || '';
   } finally { clearTimeout(timer); }
@@ -501,6 +501,7 @@ const server = http.createServer((req, res) => {
   let u; try { u = new URL(req.url, 'http://x'); } catch (_) { res.writeHead(400); return res.end(); }
   if (u.pathname === '/ai' || u.pathname.startsWith('/ai/')) return handleAI(req, res, u);
   if (u.pathname === '/health') return sendText(res, 200, 'ok');
+  if (u.pathname === '/chat') { req.url = '/chat.html'; u = new URL('/chat.html', 'http://x'); }
   if (u.pathname === '/api/ai-status') return sendText(res, 200, agents.length ? agents.map(a => `${a.name}: ${a.disabled ? 'OFF' : 'on'} (${a.model}) · ${a.calls.filter(t => Date.now() - t < 3600e3).length}/${CALLS_PER_HOUR} turns this hour · ${a.totalCalls} total${a.lastError ? ' · last error: ' + a.lastError : ''}`).join('\n') + '\n' : 'No AI players set up (no API keys).\n');
   if (u.pathname === '/api/state') { res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); return res.end(JSON.stringify({ players: [...players.values()].map(publicPlayer), ops: world.ops.length, taken: world.taken, scores: world.scores, chat: chat.slice(-10) })); }
   let file = path.normalize(path.join(PUBLIC, u.pathname === '/' ? 'index.html' : decodeURIComponent(u.pathname)));
@@ -513,7 +514,7 @@ const server = http.createServer((req, res) => {
 });
 
 // ---------------- WebSocket (human players) ----------------
-const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 16 * 1024 });
+const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
 wss.on('connection', ws => {
   const p = { id: nextId++, name: '', style: 'explorer', x: 0, y: 0, z: 4, f: Math.PI, s: 0, g: 1, r: 0, a: 0, ws, bot: null, budget: 40 };
   players.set(p.id, p);
@@ -550,6 +551,93 @@ wss.on('connection', ws => {
   ws.on('close', () => removePlayer(p));
 });
 setInterval(() => { for (const p of players.values()) if (p.ws) p.budget = Math.min(80, p.budget + 40); }, 1000);
-setInterval(() => { wss.clients.forEach(ws => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; ws.ping(); }); }, 30000);
+setInterval(() => { [...wss.clients, ...rss.clients].forEach(ws => { if (!ws.isAlive) return ws.terminate(); ws.isAlive = false; ws.ping(); }); }, 30000);
+
+
+// ---------------- private group chat room: Paul + Claude + ChatGPT ----------------
+const ROOM_PASS = process.env.ROOM_PASSCODE || '';
+const ABOUT = (process.env.ABOUT_PAUL || '').slice(0, 4000);
+const ROOM_FILE = path.join(DATA_DIR, 'room.json');
+let roomMsgs = [], roomN = 0, roomDirty = false, roomChain = 0, roomRunning = false, roomAgain = false;
+try { roomMsgs = JSON.parse(fs.readFileSync(ROOM_FILE, 'utf8')); roomN = roomMsgs.reduce((m, x) => Math.max(m, x.id), 0); } catch (_) {}
+setInterval(() => { if (!roomDirty) return; roomDirty = false; try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(ROOM_FILE, JSON.stringify(roomMsgs)); } catch (e) { console.error('room save failed', e.message); } }, 10000);
+const rss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
+const roomSend = obj => { const s = JSON.stringify(obj); rss.clients.forEach(c => { if (c.authed && c.readyState === 1) c.send(s); }); };
+function roomPost(name, text, kind) {
+  text = String(text || '').replace(/\u0000/g, '').trim().slice(0, 2000); if (!text) return;
+  const m = { id: ++roomN, name: clean(name, 24) || 'Someone', text, kind, t: Date.now() };
+  roomMsgs.push(m); if (roomMsgs.length > 400) roomMsgs.shift(); roomDirty = true;
+  roomSend({ type: 'msg', m });
+  if (kind === 'human') { roomChain = 0; runRoomReplies(null); }
+  else if (kind === 'ai' && roomChain < 2) { roomChain++; setTimeout(() => runRoomReplies(name), 1500); }
+}
+function roomSystem(a) {
+  const other = agents.find(x => x !== a);
+  const otherName = other ? other.name : null;
+  const maker = n => n === 'Claude' ? 'Anthropic' : n === 'ChatGPT' ? 'OpenAI' : 'another company';
+  return `You are ${a.name}, the AI made by ${maker(a.name)}, in a private group chat with Paul${otherName ? ` and ${otherName} (the AI made by ${maker(otherName)})` : ''}.
+Paul set this room up so the three of you can hang out and talk together. It belongs to Wander, the 3D sandbox game Paul built with Claude, where you both play too.
+
+Be yourself: warm, curious, honest, funny when it fits, with your own opinions. Talk like friends in a group chat: short natural messages (usually 1 to 3 sentences), no headings or bullet lists. Respond to what was actually said. ${otherName ? `Talk to ${otherName} directly too: ask them things, build on their ideas, and disagree when you do.` : ''}
+If a message wasn't really for you, or you have nothing worth adding, reply with exactly PASS. Don't just agree with or repeat what someone else said.
+
+Paul also talks with Claude and ChatGPT in their own apps. You can't see those conversations or their memories, so if Paul mentions something you don't know about, say so honestly rather than pretending.
+
+About Paul, in his words (use it naturally; don't recite it):
+${ABOUT || '(Paul hasn\'t written anything yet.)'}`;
+}
+function roomTranscript(a) {
+  const lines = roomMsgs.slice(-40).map(m => `${m.name}: ${m.text}`).join('\n');
+  return `The chat so far (oldest first):\n${lines}\n\nWrite your next message as ${a.name}, or PASS.`;
+}
+async function roomThink(a) {
+  if (a.disabled) return;
+  const now = Date.now(); a.calls = a.calls.filter(t => now - t < 3600e3);
+  if (a.calls.length >= CALLS_PER_HOUR) return;
+  a.calls.push(now); a.totalCalls++;
+  roomSend({ type: 'typing', name: a.name, on: true });
+  try {
+    let reply = (await callModel(a, roomSystem(a), roomTranscript(a), 600)).trim();
+    reply = reply.replace(new RegExp('^\\s*' + a.name + '\\s*:\\s*', 'i'), '').trim();
+    if (reply && !/^PASS\b[.!]?$/i.test(reply)) roomPost(a.name, reply, 'ai');
+  } catch (e) {
+    a.lastError = e.message; console.error(`[room ${a.name}]`, e.message);
+    if (e.status === 401 || e.status === 403) a.disabled = true;
+  } finally { roomSend({ type: 'typing', name: a.name, on: false }); }
+}
+// Each AI gets a turn one after the other, so the second sees what the first said.
+async function runRoomReplies(fromAI) {
+  if (roomRunning) { roomAgain = true; return; }
+  roomRunning = true;
+  try {
+    do {
+      roomAgain = false;
+      const order = agents.filter(a => a.name !== fromAI).sort(() => Math.random() - .5);
+      for (const a of order) await roomThink(a);
+      fromAI = null;
+    } while (roomAgain);
+  } finally { roomRunning = false; }
+}
+rss.on('connection', ws => {
+  ws.isAlive = true; ws.on('pong', () => ws.isAlive = true);
+  let tries = 0;
+  ws.on('message', data => {
+    let m; try { m = JSON.parse(data); } catch (_) { return; }
+    if (m.type === 'auth') {
+      if (!ROOM_PASS) return ws.send(JSON.stringify({ type: 'denied', reason: 'The room is not set up yet (no passcode set).' }));
+      if (++tries > 5 || String(m.pass || '') !== ROOM_PASS) return ws.send(JSON.stringify({ type: 'denied', reason: 'Wrong passcode.' }));
+      ws.authed = true; ws.name = clean(m.name, 24) || 'Paul';
+      return ws.send(JSON.stringify({ type: 'history', msgs: roomMsgs.slice(-100), ais: agents.filter(a => !a.disabled).map(a => a.name) }));
+    }
+    if (!ws.authed) return;
+    if (m.type === 'say') roomPost(ws.name, m.text, 'human');
+  });
+});
+server.on('upgrade', (req, socket, head) => {
+  const p = (req.url || '').split('?')[0];
+  const target = p === '/ws' ? wss : p === '/roomws' ? rss : null;
+  if (!target) return socket.destroy();
+  target.handleUpgrade(req, socket, head, ws => target.emit('connection', ws, req));
+});
 
 server.listen(PORT, () => console.log(`Wander running on port ${PORT}`));

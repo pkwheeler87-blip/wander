@@ -11,5 +11,9 @@ services:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
+      - key: ROOM_PASSCODE
+        sync: false
+      - key: ABOUT_PAUL
+        sync: false
       - key: AI_CALLS_PER_HOUR
         value: "300"

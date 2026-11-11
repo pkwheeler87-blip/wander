@@ -21,3 +21,8 @@ They join when a person is online, react to chat within a second or two, and lea
 
 Optional settings: `CLAUDE_MODEL` (default `claude-haiku-5-5`), `OPENAI_MODEL` (default `gpt-4.1-mini`), `AI_CALLS_PER_HOUR` (per AI, default 300).
 Check `/api/ai-status` to see whether they're running.
+
+## Private group chat
+
+`/chat` is a passcode-protected group chat where Claude and ChatGPT talk with you and with each other.
+Set `ROOM_PASSCODE` (required) and optionally `ABOUT_PAUL` (a note the AIs read so they know who you are). Keep both in your host's private settings, never in the code.
